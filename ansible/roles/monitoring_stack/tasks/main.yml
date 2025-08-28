@@ -1,0 +1,101 @@
+# ansible/roles/monitoring_stack/tasks/main.yml
+---
+- name: Create prometheus configuration
+  template:
+    src: prometheus.yml.j2
+    dest: "{{ monitoring_dir }}/configs/prometheus.yml"
+    owner: ubuntu
+    group: ubuntu
+    mode: '0644'
+
+- name: Create grafana provisioning directories
+  file:
+    path: "{{ item }}"
+    state: directory
+    owner: ubuntu
+    group: ubuntu
+    mode: '0755'
+  with_items:
+    - "{{ monitoring_dir }}/configs/grafana/provisioning/datasources"
+    - "{{ monitoring_dir }}/configs/grafana/provisioning/dashboards"
+
+- name: Create grafana datasource configuration
+  template:
+    src: grafana-datasource.yml.j2
+    dest: "{{ monitoring_dir }}/configs/grafana/provisioning/datasources/prometheus.yml"
+    owner: ubuntu
+    group: ubuntu
+    mode: '0644'
+
+- name: Create grafana dashboard provider configuration
+  template:
+    src: grafana-dashboards.yml.j2
+    dest: "{{ monitoring_dir }}/configs/grafana/provisioning/dashboards/default.yml"
+    owner: ubuntu
+    group: ubuntu
+    mode: '0644'
+
+- name: Create docker-compose file for monitoring stack
+  template:
+    src: docker-compose.yml.j2
+    dest: "{{ monitoring_dir }}/docker-compose.yml"
+    owner: ubuntu
+    group: ubuntu
+    mode: '0644'
+
+- name: Set correct permissions for prometheus data directory
+  file:
+    path: "{{ prometheus_data_dir }}"
+    state: directory
+    owner: "65534"  # nobody user for prometheus container
+    group: "65534"
+    mode: '0755'
+
+- name: Set correct permissions for grafana data directory
+  file:
+    path: "{{ grafana_data_dir }}"
+    state: directory
+    owner: "472"  # grafana user in container
+    group: "472"
+    mode: '0755'
+
+- name: Start monitoring stack
+  community.docker.docker_compose:
+    project_src: "{{ monitoring_dir }}"
+    state: present
+    pull: yes
+  become_user: ubuntu
+
+- name: Wait for Prometheus to be available
+  uri:
+    url: "http://localhost:9090/-/healthy"
+    method: GET
+  register: prometheus_health
+  until: prometheus_health.status == 200
+  retries: 30
+  delay: 10
+
+- name: Wait for Grafana to be available
+  uri:
+    url: "http://localhost:3000/api/health"
+    method: GET
+  register: grafana_health
+  until: grafana_health.status == 200
+  retries: 30
+  delay: 10
+
+- name: Create systemd service for monitoring stack
+  template:
+    src: monitoring-stack.service.j2
+    dest: /etc/systemd/system/monitoring-stack.service
+    mode: '0644'
+  notify:
+    - reload systemd
+    - enable monitoring stack
+
+- name: Install monitoring utilities
+  pip:
+    name:
+      - docker
+      - docker-compose
+    state: present
