@@ -1,0 +1,198 @@
+# .gitlab-ci.yml
+stages:
+  - validate
+  - provision
+  - configure
+  - cleanup
+
+variables:
+  TARGET_CLOUD: "gcp"
+  TF_ROOT: ${CI_PROJECT_DIR}/terraform/${TARGET_CLOUD}
+  TF_ADDRESS: ${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/terraform/state/sre-server-${TARGET_CLOUD}
+  ANSIBLE_HOST_KEY_CHECKING: "False"
+  ANSIBLE_STDOUT_CALLBACK: "yaml"
+
+# Expected pipeline variables (set per cloud as needed):
+#
+# Common:
+# - SSH_PRIVATE_KEY (base64 of private key used by Ansible to connect)
+# - SSH_PUBLIC_KEY  (public key string used for Azure/GCP VM auth)
+#
+# AWS:
+# - AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION (default us-east-1)
+# - KEY_PAIR_NAME (existing AWS EC2 KeyPair name)
+#
+# Azure:
+# - ARM_SUBSCRIPTION_ID, ARM_TENANT_ID, ARM_CLIENT_ID, ARM_CLIENT_SECRET
+# - AZURE_LOCATION (e.g. eastus)
+#
+# GCP:
+# - GOOGLE_CREDENTIALS (JSON content)
+# - GCP_PROJECT, GCP_REGION (e.g. us-central1), GCP_ZONE (e.g. us-central1-a)
+
+.terraform_image: &terraform_image
+  image: registry.gitlab.com/gitlab-org/terraform-images/stable:latest
+
+before_script:
+  - export PATH="$CI_PROJECT_DIR/bin:$HOME/.local/bin:$PATH"
+  - mkdir -p "$CI_PROJECT_DIR/bin"
+  - |
+    if ! command -v terraform >/dev/null 2>&1; then
+      echo "Installing Terraform locally..."
+      curl -fsSL https://releases.hashicorp.com/terraform/1.8.5/terraform_1.8.5_linux_amd64.zip -o /tmp/terraform.zip
+      unzip -o /tmp/terraform.zip -d /tmp
+      mv /tmp/terraform "$CI_PROJECT_DIR/bin/terraform"
+      chmod +x "$CI_PROJECT_DIR/bin/terraform"
+      terraform version
+    fi
+  - |
+    if ! command -v jq >/dev/null 2>&1; then
+      echo "Installing jq locally..."
+      curl -fsSL https://github.com/jqlang/jq/releases/download/jq-1.7.1/jq-linux-amd64 -o "$CI_PROJECT_DIR/bin/jq"
+      chmod +x "$CI_PROJECT_DIR/bin/jq"
+      jq --version
+    fi
+  - mkdir -p ~/.ssh
+  - echo "$SSH_PRIVATE_KEY" | base64 -d > ~/.ssh/id_rsa
+  - chmod 600 ~/.ssh/id_rsa
+
+validate:
+  stage: validate
+  <<: *terraform_image
+  script:
+    - cd $TF_ROOT
+    - terraform fmt -recursive
+    - terraform init -backend=false
+    - terraform validate
+  rules:
+    - when: manual
+
+provision:
+  stage: provision
+  <<: *terraform_image
+  script:
+    - cd $TF_ROOT
+    - |
+      terraform init \
+        -backend-config="address=${TF_ADDRESS}" \
+        -backend-config="lock_address=${TF_ADDRESS}/lock" \
+        -backend-config="unlock_address=${TF_ADDRESS}/lock" \
+        -backend-config="username=gitlab-ci-token" \
+        -backend-config="password=${CI_JOB_TOKEN}" \
+        -backend-config="lock_method=POST" \
+        -backend-config="unlock_method=DELETE" \
+        -backend-config="retry_wait_min=5"
+    - |
+      case "$TARGET_CLOUD" in
+        aws)
+          terraform plan -out=planfile \
+            -var="aws_access_key=${AWS_ACCESS_KEY_ID}" \
+            -var="aws_secret_key=${AWS_SECRET_ACCESS_KEY}" \
+            -var="aws_region=${AWS_REGION:-us-east-1}" \
+            -var="key_pair_name=${KEY_PAIR_NAME}" ;;
+        azure)
+          export ARM_SUBSCRIPTION_ID ARM_TENANT_ID ARM_CLIENT_ID ARM_CLIENT_SECRET
+          terraform plan -out=planfile \
+            -var="location=${AZURE_LOCATION:-eastus}" \
+            -var="ssh_public_key=${SSH_PUBLIC_KEY}" ;;
+        gcp)
+          # Debug presence of required GCP variables (no secrets printed)
+          echo "GCP var presence check:"
+          if [ -n "${GCP_PROJECT:-}" ]; then echo " - GCP_PROJECT: SET (len=${#GCP_PROJECT})"; else echo " - GCP_PROJECT: MISSING"; fi
+          if [ -n "${GCP_REGION:-}" ]; then echo " - GCP_REGION: SET (len=${#GCP_REGION})"; else echo " - GCP_REGION: MISSING"; fi
+          if [ -n "${GCP_ZONE:-}" ]; then echo " - GCP_ZONE: SET (len=${#GCP_ZONE})"; else echo " - GCP_ZONE: MISSING"; fi
+          if [ -n "${SSH_PUBLIC_KEY:-}" ]; then echo " - SSH_PUBLIC_KEY: SET (len=${#SSH_PUBLIC_KEY})"; else echo " - SSH_PUBLIC_KEY: MISSING"; fi
+          if [ -n "${GOOGLE_CREDENTIALS:-}" ]; then echo " - GOOGLE_CREDENTIALS: SET (json length=${#GOOGLE_CREDENTIALS})"; else echo " - GOOGLE_CREDENTIALS: MISSING"; fi
+
+          # Validate required GCP variables before planning
+          if [ -z "${GOOGLE_CREDENTIALS:-}" ] || [ -z "${GCP_PROJECT:-}" ] || [ -z "${GCP_REGION:-}" ] || [ -z "${GCP_ZONE:-}" ] || [ -z "${SSH_PUBLIC_KEY:-}" ]; then
+            echo "Missing required GCP variables. Please set: GOOGLE_CREDENTIALS, GCP_PROJECT, GCP_REGION, GCP_ZONE, SSH_PUBLIC_KEY" >&2
+            exit 1
+          fi
+          export GOOGLE_CREDENTIALS
+          terraform plan -out=planfile \
+            -var="project=${GCP_PROJECT}" \
+            -var="region=${GCP_REGION:-us-central1}" \
+            -var="zone=${GCP_ZONE:-us-central1-a}" \
+            -var="ssh_public_key=${SSH_PUBLIC_KEY}" ;;
+        *) echo "Unsupported TARGET_CLOUD: $TARGET_CLOUD" && exit 1 ;;
+      esac
+    - terraform apply -input=false planfile
+    - terraform output -json > terraform_outputs.json
+  artifacts:
+    paths:
+      - $TF_ROOT/terraform_outputs.json
+    expire_in: 1 day
+  rules:
+    - when: manual
+  dependencies:
+    - validate
+
+configure:
+  stage: configure
+  script:
+    - export PATH="$CI_PROJECT_DIR/bin:$HOME/.local/bin:$PATH"
+    - python3 -m pip install --user --upgrade pip
+    - python3 -m pip install --user ansible==7.7.0
+    - ansible-galaxy collection install community.docker
+    - cd ansible
+    - mkdir -p inventory
+    - export PUBLIC_IP=$(jq -r '.public_ip.value' ../terraform/${TARGET_CLOUD}/terraform_outputs.json)
+    - export INSTANCE_ID=$(jq -r '.instance_id.value' ../terraform/${TARGET_CLOUD}/terraform_outputs.json)
+    - export SSH_USER=$(jq -r '.ssh_user.value' ../terraform/${TARGET_CLOUD}/terraform_outputs.json)
+    - echo "[sre_servers]" > inventory/hosts
+    - echo "sre-server ansible_host=$PUBLIC_IP ansible_user=$SSH_USER ansible_ssh_private_key_file=~/.ssh/id_rsa" >> inventory/hosts
+    - echo "Waiting for instance to be reachable via SSH..."
+    - |
+      for i in $(seq 1 30); do
+        if ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 -i ~/.ssh/id_rsa $SSH_USER@$PUBLIC_IP 'echo ok' 2>/dev/null; then
+          echo "SSH is ready"; break; fi; echo "...retrying ($i/30)"; sleep 10; done
+    - ansible-playbook -i inventory/hosts playbooks/site.yml --ssh-extra-args='-o StrictHostKeyChecking=no'
+  dependencies:
+    - provision
+  rules:
+    - when: manual
+
+cleanup:
+  stage: cleanup
+  <<: *terraform_image
+  script:
+    - cd $TF_ROOT
+    - |
+      terraform init \
+        -backend-config="address=${TF_ADDRESS}" \
+        -backend-config="lock_address=${TF_ADDRESS}/lock" \
+        -backend-config="unlock_address=${TF_ADDRESS}/lock" \
+        -backend-config="username=gitlab-ci-token" \
+        -backend-config="password=${CI_JOB_TOKEN}" \
+        -backend-config="lock_method=POST" \
+        -backend-config="unlock_method=DELETE" \
+        -backend-config="retry_wait_min=5"
+    - |
+      case "$TARGET_CLOUD" in
+        aws)
+          terraform destroy -auto-approve \
+            -var="aws_access_key=${AWS_ACCESS_KEY_ID}" \
+            -var="aws_secret_key=${AWS_SECRET_ACCESS_KEY}" \
+            -var="aws_region=${AWS_REGION:-us-east-1}" \
+            -var="key_pair_name=${KEY_PAIR_NAME}" ;;
+        azure)
+          export ARM_SUBSCRIPTION_ID ARM_TENANT_ID ARM_CLIENT_ID ARM_CLIENT_SECRET
+          terraform destroy -auto-approve \
+            -var="location=${AZURE_LOCATION:-eastus}" \
+            -var="ssh_public_key=${SSH_PUBLIC_KEY}" ;;
+        gcp)
+          export GOOGLE_CREDENTIALS
+          terraform destroy -auto-approve \
+            -var="project=${GCP_PROJECT}" \
+            -var="region=${GCP_REGION:-us-central1}" \
+            -var="zone=${GCP_ZONE:-us-central1-a}" \
+            -var="ssh_public_key=${SSH_PUBLIC_KEY}" ;;
+        *) echo "Unsupported TARGET_CLOUD: $TARGET_CLOUD" && exit 1 ;;
+      esac
+  rules:
+    - when: manual
+  allow_failure: true
+
+
+

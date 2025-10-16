@@ -1,0 +1,42 @@
+# ansible/playbooks/site.yml
+---
+- name: Configure SRE Monitoring Server
+  hosts: sre_servers
+  become: yes
+  gather_facts: yes
+  vars:
+    prometheus_version: "2.47.0"
+    grafana_version: "10.1.0"
+    node_exporter_version: "1.6.1"
+    cadvisor_version: "v0.47.2"
+    monitoring_dir: "/opt/monitoring"
+    prometheus_data_dir: "/opt/monitoring/prometheus/data"
+    grafana_data_dir: "/opt/monitoring/grafana/data"
+
+  pre_tasks:
+    - name: Wait for system to become reachable
+      wait_for_connection:
+        timeout: 300
+
+    - name: Wait for user-data script to complete
+      wait_for:
+        path: /var/log/user-data-complete.log
+        timeout: 600
+
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+  roles:
+    - system_hardening
+    - monitoring_stack
+
+  post_tasks:
+    - name: Display access information
+      debug:
+        msg:
+          - "SRE Monitoring Server Setup Complete!"
+          - "Prometheus: http://{{ ansible_default_ipv4.address | default('HOST_IP') }}:9090"
+          - "Grafana: http://{{ ansible_default_ipv4.address | default('HOST_IP') }}:3000"
+          - "Default Grafana credentials: admin/admin"

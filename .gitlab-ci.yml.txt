@@ -1,0 +1,111 @@
+# .gitlab-ci.yml
+stages:
+  - validate
+  - provision
+  - configure
+  - cleanup
+
+variables:
+  TF_ROOT: ${CI_PROJECT_DIR}/terraform
+  TF_ADDRESS: ${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/terraform/state/sre-server
+  ANSIBLE_HOST_KEY_CHECKING: "False"
+  ANSIBLE_STDOUT_CALLBACK: "yaml"
+
+# Manual variables to be set when running pipeline
+# AWS_ACCESS_KEY_ID (pipeline variable)
+# AWS_SECRET_ACCESS_KEY (pipeline variable) 
+# AWS_REGION (pipeline variable, default: us-east-1)
+# KEY_PAIR_NAME (pipeline variable)
+# SSH_PRIVATE_KEY (pipeline variable - base64 encoded private key)
+
+before_script:
+  - apk add --no-cache python3 py3-pip openssh-client
+  - pip3 install boto3 botocore
+  - mkdir -p ~/.ssh
+  - echo "$SSH_PRIVATE_KEY" | base64 -d > ~/.ssh/id_rsa
+  - chmod 600 ~/.ssh/id_rsa
+  - ssh-keyscan -H github.com >> ~/.ssh/known_hosts
+
+validate:
+  stage: validate
+  image: registry.gitlab.com/gitlab-org/terraform-images/stable:latest
+  script:
+    - cd $TF_ROOT
+    - terraform fmt -check
+    - terraform init -backend=false
+    - terraform validate
+  rules:
+    - when: manual
+
+provision:
+  stage: provision
+  image: registry.gitlab.com/gitlab-org/terraform-images/stable:latest
+  script:
+    - cd $TF_ROOT
+    - terraform init
+      -backend-config="address=${TF_ADDRESS}"
+      -backend-config="lock_address=${TF_ADDRESS}/lock"
+      -backend-config="unlock_address=${TF_ADDRESS}/lock"
+      -backend-config="username=gitlab-ci-token"
+      -backend-config="password=${CI_JOB_TOKEN}"
+      -backend-config="lock_method=POST"
+      -backend-config="unlock_method=DELETE"
+      -backend-config="retry_wait_min=5"
+    - terraform plan -out="planfile"
+      -var="aws_access_key=${AWS_ACCESS_KEY_ID}"
+      -var="aws_secret_key=${AWS_SECRET_ACCESS_KEY}"
+      -var="aws_region=${AWS_REGION}"
+      -var="key_pair_name=${KEY_PAIR_NAME}"
+    - terraform apply -input=false "planfile"
+    - terraform output -json > terraform_outputs.json
+  artifacts:
+    reports:
+      terraform: $TF_ROOT/planfile.json
+    paths:
+      - $TF_ROOT/terraform_outputs.json
+    expire_in: 1 day
+  rules:
+    - when: manual
+  dependencies:
+    - validate
+
+configure:
+  stage: configure
+  image: willhallonline/ansible:2.9-alpine
+  script:
+    - apk add --no-cache jq
+    - cd ansible
+    - export INSTANCE_IP=$(jq -r '.ec2_public_ip.value' ../terraform/terraform_outputs.json)
+    - export INSTANCE_ID=$(jq -r '.ec2_instance_id.value' ../terraform/terraform_outputs.json)
+    - echo "[sre_servers]" > inventory/hosts
+    - echo "sre-server ansible_host=$INSTANCE_IP ansible_user=ubuntu ansible_ssh_private_key_file=~/.ssh/id_rsa" >> inventory/hosts
+    - echo "Waiting for EC2 instance to be ready..."
+    - sleep 60
+    - ansible-playbook -i inventory/hosts playbooks/site.yml --ssh-extra-args='-o StrictHostKeyChecking=no'
+  dependencies:
+    - provision
+  rules:
+    - when: manual
+
+cleanup:
+  stage: cleanup
+  image: registry.gitlab.com/gitlab-org/terraform-images/stable:latest
+  script:
+    - cd $TF_ROOT
+    - terraform init
+      -backend-config="address=${TF_ADDRESS}"
+      -backend-config="lock_address=${TF_ADDRESS}/lock"
+      -backend-config="unlock_address=${TF_ADDRESS}/lock"
+      -backend-config="username=gitlab-ci-token"
+      -backend-config="password=${CI_JOB_TOKEN}"
+      -backend-config="lock_method=POST"
+      -backend-config="unlock_method=DELETE"
+      -backend-config="retry_wait_min=5"
+    - terraform destroy -auto-approve
+      -var="aws_access_key=${AWS_ACCESS_KEY_ID}"
+      -var="aws_secret_key=${AWS_SECRET_ACCESS_KEY}"
+      -var="aws_region=${AWS_REGION}"
+      -var="key_pair_name=${KEY_PAIR_NAME}"
+  rules:
+    - when: manual
+  allow_failure: true

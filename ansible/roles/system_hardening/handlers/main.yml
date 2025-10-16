@@ -1,0 +1,22 @@
+# ansible/roles/system_hardening/handlers/main.yml
+---
+- name: restart fail2ban
+  systemd:
+    name: fail2ban
+    state: restarted
+
+- name: reload sysctl
+  command: sysctl -p /etc/sysctl.d/99-monitoring-sysctl.conf
+
+---
+# ansible/roles/monitoring_stack/handlers/main.yml
+---
+- name: reload systemd
+  systemd:
+    daemon_reload: yes
+
+- name: enable monitoring stack
+  systemd:
+    name: monitoring-stack
+    enabled: yes
+    state: started
